@@ -108,6 +108,9 @@ def gemm_a16w16(x,
     - Y: The output matrix with shape (M, N).
     """
     
+    assert A.shape == (8192, 65536), f"Expected A shape (8192, 65536), got {A.shape}"
+    assert B.shape == (65536, 28672), f"Expected B shape (65536, 28672), got {B.shape}"
+
     M, K = x.shape
     K, N = w.shape
 
@@ -123,29 +126,42 @@ def gemm_a16w16(x,
     num_warps = 8
     num_stages = 2
 
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    _gemm_a16_w16_kernel[grid](
-        x,
-        w,
-        y,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        y.stride(0),
-        y.stride(1),
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        waves_per_eu=waves_per_eu,
-        kpack=kpack,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    # Process blocks directly using .view()
+    for i in range(2):
+        for j in range(7):
+            # Extract A block using .view(): (8192, 65536) -> (2, 4096, 65536)[i]
+            x_block = x.view(2, 4096, 65536)[i]  # Shape: (4096, 65536)
+
+            # Extract B block using .view(): (65536, 28672) -> (65536, 7, 4096)[:, j, :]
+            w_block = w.view(65536, 7, 4096)[:, j, :].contiguous()  # Shape: (65536, 4096)
+
+            # Create output view directly in final result tensor
+            # Map (i,j) block to correct position: (8192, 28672) -> (2, 4096, 7, 4096)[i, :, j, :]
+            output_view = y.view(2, 4096, 7, 4096)[i, :, j, :].contiguous()
+
+            grid = lambda META: (triton.cdiv(4096, META['BLOCK_SIZE_M']) * triton.cdiv(4096, META['BLOCK_SIZE_N']), )
+            _gemm_a16_w16_kernel[grid](
+                x_block,
+                w_block,
+                output_view,
+                M,
+                N,
+                K,
+                x.stride(0),
+                x.stride(1),
+                w.stride(0),
+                w.stride(1),
+                y.stride(0),
+                y.stride(1),
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GROUP_SIZE_M,
+                waves_per_eu=waves_per_eu,
+                kpack=kpack,
+                matrix_instr_nonkdim=matrix_instr_nonkdim,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
 
     return y
