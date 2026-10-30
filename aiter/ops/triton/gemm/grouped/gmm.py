@@ -18,6 +18,7 @@ from torch import Tensor
 # AITER: GMM Gluon kernel (gfx1250 only)
 from aiter.ops.triton._gluon_kernels.gfx1250.gemm.grouped.gmm import (
     _gmm_gluon_kernel,
+    get_gmm_gluon_layouts,
 )
 
 # AITER: GMM Triton kernels
@@ -58,12 +59,25 @@ _GMM_TILE_COUNTER_CACHE: dict[tuple[torch.device, int], Tensor] = {}
 _GLUON_ARCHS = ("gfx1250",)
 
 
-def get_gluon_config(variant: str) -> dict[str, int]:
-    """Config of one GMM variant for the gluon backend."""
+def get_gluon_config(variant: str, M: int, K: int, N: int, G: int) -> dict[str, int]:
+    """Config of one GMM variant for the gluon backend.
+
+    The first matching shape rule wins, else ``default``. Rows are averaged
+    over the groups (M / G) because group_sizes lives on the device and
+    reading it here would force a host sync.
+    """
     cfg_dir = resolve_config_dir("gemm", "grouped", backend="gluon")
     config_dict = load_config_json(f"{cfg_dir}/DEFAULT.json")
     assert variant in config_dict, f"No gluon config for GMM variant '{variant}'."
-    return config_dict[variant]["default"]
+    variant_cfg = config_dict[variant]
+    for rule in variant_cfg.get("dispatch", []):
+        if (
+            K >= rule.get("min_K", 0)
+            and N >= rule.get("min_N", 0)
+            and M >= rule.get("min_avg_rows_per_group", 0) * G
+        ):
+            return variant_cfg[rule["config"]]
+    return variant_cfg["default"]
 
 
 def _gluon_gmm_supported(lhs, rhs, out, bias, trans_rhs, work_stealing):
@@ -134,10 +148,10 @@ def _gmm_grid(
     return (num_programs,)
 
 
-def _gmm_gluon(lhs, rhs, group_sizes, bias, out, K, N, G, config, grid_dim):
+def _gmm_gluon(lhs, rhs, group_sizes, bias, out, M, K, N, G, config, grid_dim):
     """Launch the gfx1250 Gluon GMM kernel. Caller has checked the fast path."""
     if config is None:
-        config = get_gluon_config("gmm")
+        config = get_gluon_config("gmm", M, K, N, G)
 
     block_k = config["BLOCK_SIZE_K"]
     # The pipeline keeps NUM_BUFFERS - 1 K tiles in flight, so it cannot be
@@ -147,6 +161,15 @@ def _gmm_gluon(lhs, rhs, group_sizes, bias, out, K, N, G, config, grid_dim):
 
     num_programs = grid_dim if grid_dim is not None else config["GRID_DIM"]
     assert num_programs > 0, f"Invalid grid dimension {num_programs}."
+
+    num_ctas = config.get("num_ctas", 1)
+    layouts = get_gmm_gluon_layouts(
+        config["num_warps"],
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        block_k,
+        num_ctas,
+    )
 
     # fmt: off
     _gmm_gluon_kernel[(num_programs,)](
@@ -163,7 +186,10 @@ def _gmm_gluon(lhs, rhs, group_sizes, bias, out, K, N, G, config, grid_dim):
         GROUP_M=config["GROUP_SIZE"],
         NUM_BUFFERS=num_buffers,
         USE_BIAS=bias is not None,
+        NUM_SUBTILES=config.get("NUM_SUBTILES", 1),
+        **layouts,
         num_warps=config["num_warps"],
+        num_ctas=num_ctas,
     )
     # fmt: on
     return out
@@ -302,7 +328,9 @@ def gmm(
         use_gluon = False
 
     if use_gluon:
-        return _gmm_gluon(lhs, rhs, group_sizes, bias, out, K, N, G, config, grid_dim)
+        return _gmm_gluon(
+            lhs, rhs, group_sizes, bias, out, M, K, N, G, config, grid_dim
+        )
 
     if config is None:
         config = get_config("gmm", M, K, N, G)

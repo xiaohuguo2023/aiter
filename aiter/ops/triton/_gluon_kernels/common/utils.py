@@ -99,3 +99,21 @@ def interleaved_rope(x, cos, sin):
     rotated = _get_gptj_rotated_x(x, is_even, NUM_ROWS, NUM_COLS, NUM_COLS // 2)
     # The helper reshapes x. convert_layout gives rotated the layout of x again.
     return x * cos + gl.convert_layout(rotated, x.type.layout) * sin
+
+
+@gluon.constexpr_function
+def cluster_shape(num_ctas, BLOCK_M, BLOCK_N):
+    """Split ``num_ctas`` CTAs over a (BLOCK_M, BLOCK_N) cluster tile.
+
+    Halves whichever of the two tile dimensions is still larger, so each CTA
+    gets as square a share as the tile allows.
+    """
+    if num_ctas < 1 or num_ctas & (num_ctas - 1):
+        raise ValueError(f"num_ctas must be a power of 2, got {num_ctas}")
+    ctas_m, ctas_n = 1, 1
+    while ctas_m * ctas_n < num_ctas:
+        if BLOCK_N // ctas_n > BLOCK_M // ctas_m:
+            ctas_n *= 2
+        else:
+            ctas_m *= 2
+    return ctas_m, ctas_n
