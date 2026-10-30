@@ -15,6 +15,11 @@ import torch
 import triton
 from torch import Tensor
 
+# AITER: GMM Gluon kernel (gfx1250 only)
+from aiter.ops.triton._gluon_kernels.gfx1250.gemm.grouped.gmm import (
+    _gmm_gluon_kernel,
+)
+
 # AITER: GMM Triton kernels
 from aiter.ops.triton._triton_kernels.gemm.grouped.gmm import (
     get_config,
@@ -22,6 +27,8 @@ from aiter.ops.triton._triton_kernels.gemm.grouped.gmm import (
     tgmm_non_persistent_kernel,
     tgmm_persistent_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # AITER: GMM utility functions
 from aiter.ops.triton.utils.gmm_common import (
@@ -46,6 +53,34 @@ from aiter.ops.triton.utils.gmm_common import (
 # scratch buffer is reused across launches to avoid an allocator round-trip plus
 # 4-byte host to device copy on every call.
 _GMM_TILE_COUNTER_CACHE: dict[tuple[torch.device, int], Tensor] = {}
+
+# The Gluon GMM kernel uses gfx1250 TDM descriptors and WMMA.
+_GLUON_ARCHS = ("gfx1250",)
+
+
+def get_gluon_config(variant: str) -> dict[str, int]:
+    """Config of one GMM variant for the gluon backend."""
+    cfg_dir = resolve_config_dir("gemm", "grouped", backend="gluon")
+    config_dict = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    assert variant in config_dict, f"No gluon config for GMM variant '{variant}'."
+    return config_dict[variant]["default"]
+
+
+def _gluon_gmm_supported(lhs, rhs, out, bias, trans_rhs, work_stealing):
+    """Is this call on the gluon fast path? Returns (bool, reason)."""
+    if get_arch() not in _GLUON_ARCHS:
+        return False, f"arch {get_arch()} is not in {_GLUON_ARCHS}"
+    if trans_rhs:
+        return False, "rhs must be non-transposed (G, K, N)"
+    if work_stealing:
+        return False, "work stealing is not implemented in the gluon kernel"
+    if lhs.dtype.itemsize != 2 or rhs.dtype.itemsize != 2:
+        return False, "lhs and rhs must be 16-bit"
+    if out.dtype.itemsize != 2:
+        return False, "out must be 16-bit"
+    if bias is not None and bias.dtype != out.dtype:
+        return False, "bias dtype must match out dtype"
+    return True, ""
 
 
 def _get_gmm_tile_counter(device: torch.device, grid_dim: int) -> Tensor:
@@ -99,6 +134,41 @@ def _gmm_grid(
     return (num_programs,)
 
 
+def _gmm_gluon(lhs, rhs, group_sizes, bias, out, K, N, G, config, grid_dim):
+    """Launch the gfx1250 Gluon GMM kernel. Caller has checked the fast path."""
+    if config is None:
+        config = get_gluon_config("gmm")
+
+    block_k = config["BLOCK_SIZE_K"]
+    # The pipeline keeps NUM_BUFFERS - 1 K tiles in flight, so it cannot be
+    # deeper than the number of K tiles.
+    num_k_tiles = triton.cdiv(K, block_k)
+    num_buffers = max(2, min(config["NUM_BUFFERS"], num_k_tiles + 1))
+
+    num_programs = grid_dim if grid_dim is not None else config["GRID_DIM"]
+    assert num_programs > 0, f"Invalid grid dimension {num_programs}."
+
+    # fmt: off
+    _gmm_gluon_kernel[(num_programs,)](
+        lhs, rhs, out, group_sizes, bias,
+        N, K, G,
+        lhs.stride(0), lhs.stride(1),
+        rhs.stride(0), rhs.stride(1), rhs.stride(2),
+        out.stride(0), out.stride(1),
+        0 if bias is None else bias.stride(0),
+        NUM_PROGRAMS=num_programs,
+        BLOCK_M=config["BLOCK_SIZE_M"],
+        BLOCK_N=config["BLOCK_SIZE_N"],
+        BLOCK_K=block_k,
+        GROUP_M=config["GROUP_SIZE"],
+        NUM_BUFFERS=num_buffers,
+        USE_BIAS=bias is not None,
+        num_warps=config["num_warps"],
+    )
+    # fmt: on
+    return out
+
+
 def gmm(
     lhs: Tensor,
     rhs: Tensor,
@@ -109,6 +179,7 @@ def gmm(
     work_stealing: bool = False,
     config: dict[str, int] | None = None,
     grid_dim: int | None = None,
+    backend: str | None = None,
 ) -> Tensor:
     """
     Perform Group Matrix Multiplication (GMM): out = lhs @ rhs + bias
@@ -165,6 +236,11 @@ def gmm(
         Optional override for GRID_DIM config. It's useful to override it while doing performance
         experiments or launching the GMM kernel in parallel with a comms kernel (reserve some CUs
         for comms).
+    backend : str or None, optional
+        "triton", "gluon", or None to select automatically. The gluon backend is a gfx1250 kernel
+        and needs a non-transposed rhs, 16-bit inputs and outputs, and no work stealing. None picks
+        gluon when the call meets those conditions, and triton otherwise. "gluon" on a call that
+        does not meet them raises AssertionError.
 
     Returns
     -------
@@ -211,6 +287,22 @@ def gmm(
     )
 
     trans_rhs, _ = get_gmm_transposition(lhs, rhs, out)
+
+    assert backend in (
+        None,
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton', 'gluon' or None."
+    use_gluon, why_not = _gluon_gmm_supported(
+        lhs, rhs, out, bias, trans_rhs, work_stealing
+    )
+    if backend == "gluon":
+        assert use_gluon, f"The gluon GMM backend cannot run this call: {why_not}."
+    elif backend == "triton":
+        use_gluon = False
+
+    if use_gluon:
+        return _gmm_gluon(lhs, rhs, group_sizes, bias, out, K, N, G, config, grid_dim)
 
     if config is None:
         config = get_config("gmm", M, K, N, G)

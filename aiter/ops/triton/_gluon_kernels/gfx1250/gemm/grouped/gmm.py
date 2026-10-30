@@ -133,7 +133,9 @@ def _gmm_gluon_kernel(
     m_start = 0
 
     for g in range(G):
-        gm = gl.load(GroupSizes + g)
+        # group_sizes may be int64, but a TDM descriptor's shape must be 32-bit.
+        # Only the base pointer offsets below are widened.
+        gm = gl.load(GroupSizes + g).to(gl.int32)
         num_m_tiles = tl.cdiv(gm, BLOCK_M)
         num_tiles = num_m_tiles * num_n_tiles
 

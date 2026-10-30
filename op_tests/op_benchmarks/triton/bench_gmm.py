@@ -8,6 +8,7 @@
 # Python standard library
 import argparse
 import logging
+from functools import partial
 
 # PyTorch
 import torch
@@ -100,13 +101,13 @@ assert (
 ), "Mismatch between available benchmark metrics and respective units."
 
 
-def select_triton_kernel(gmm_type: str):
+def select_triton_kernel(gmm_type: str, backend: str | None = None):
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
     if gmm_type == "gmm":
         desc, gen_tensors, kernel_wrapper = (
             "GMM",
             gen_gmm_tensors,
-            triton_gmm,
+            triton_gmm if backend is None else partial(triton_gmm, backend=backend),
         )
     if gmm_type == "ptgmm":
         desc, gen_tensors, kernel_wrapper = (
@@ -144,11 +145,12 @@ def benchmark_gmm(
     grid_dim: int | None = None,
     work_stealing: bool = False,
     output: bool = False,
+    backend: str | None = None,
 ) -> None:
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
     assert metric in METRICS, "Invalid benchmark metric."
 
-    desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type)
+    desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type, backend)
 
     in_dtype_str: str = str_from_dtype(in_dtype)
     out_dtype_str: str = str_from_dtype(out_dtype)
@@ -157,7 +159,7 @@ def benchmark_gmm(
     has_grid_dim: bool = gmm_type != "nptgmm" and grid_dim is not None
     has_work_stealing: bool = gmm_type == "gmm" and work_stealing
     triton_provider_desc: list[str] = [
-        "triton",
+        backend if backend is not None else "triton",
         gmm_type,
         # data types
         f"i{in_dtype_str}",
@@ -524,6 +526,7 @@ def main() -> None:
         grid_dim=args.grid_dim,
         work_stealing=args.work_stealing,
         output=args.o,
+        backend=args.backend,
     )
 
 

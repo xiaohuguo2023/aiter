@@ -253,6 +253,84 @@ def test_gmm(
         )
 
 
+GLUON_ARCHS: tuple[str, ...] = ("gfx1250",)
+
+
+@pytest.mark.parametrize("M, K, N, G", TEST_SHAPES)
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("group_sizes_dtype", [torch.int32, torch.int64])
+def test_gmm_gluon(
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    use_bias: bool,
+    group_sizes_dtype: torch.dtype,
+):
+    """The gluon backend must match the torch reference on its fast path."""
+    if get_arch() not in GLUON_ARCHS:
+        pytest.skip(f"The gluon GMM backend needs one of {GLUON_ARCHS}.")
+
+    in_dtype = out_dtype = DTYPE
+
+    lhs, rhs, multiple_group_sizes, out_torch, bias = gen_gmm_tensors(
+        M,
+        K,
+        N,
+        G,
+        NUM_GROUP_SIZES,
+        input_type=in_dtype,
+        output_type=out_dtype,
+        group_sizes_dtype=group_sizes_dtype,
+        trans_rhs=False,  # the gluon kernel takes the non-transposed rhs only
+        rng_seed=RNG_SEED,
+        unif_group_sizes=True,
+        use_bias=use_bias,
+    )
+    out_gluon = torch.empty_like(out_torch)
+
+    for group_sizes in multiple_group_sizes:
+        torch_gmm(
+            lhs,
+            rhs,
+            group_sizes,
+            preferred_element_type=out_dtype,
+            existing_out=out_torch,
+            bias=bias,
+        )
+        triton_gmm(
+            lhs,
+            rhs,
+            group_sizes,
+            bias=bias,
+            preferred_element_type=out_dtype,
+            existing_out=out_gluon,
+            backend="gluon",
+        )
+        m = int(torch.sum(group_sizes).item())
+        atol = rtol = 0.02 if use_bias else None
+        check_tensors(
+            out_gluon[:m],
+            out_torch[:m],
+            "Gluon GMM doesn't match PyTorch reference GMM.",
+            atol=atol,
+            rtol=rtol,
+        )
+
+
+def test_gmm_gluon_rejects_transposed_rhs():
+    """A transposed rhs is off the gluon fast path, so forcing it must raise."""
+    if get_arch() not in GLUON_ARCHS:
+        pytest.skip(f"The gluon GMM backend needs one of {GLUON_ARCHS}.")
+
+    M, K, N, G = 32, 16, 8, 4
+    lhs, rhs, multiple_group_sizes, _, _ = gen_gmm_tensors(
+        M, K, N, G, 1, trans_rhs=True, rng_seed=RNG_SEED, unif_group_sizes=True
+    )
+    with pytest.raises(AssertionError, match="non-transposed"):
+        triton_gmm(lhs, rhs, multiple_group_sizes[0], backend="gluon")
+
+
 @pytest.mark.parametrize(
     "M, K, N, G", [OTHER_REAL_SHAPE, OTHER_REAL_SHAPE[:-1] + (17,)]
 )
